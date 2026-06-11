@@ -1,27 +1,22 @@
 # KDA Kernel 简化版
 
-这份笔记按 `Gated DeltaNet Kernel 简化版.md` 的顺序写，方便逐节对照实现：
+这份笔记按 `naive_chunk_kda` 的矩阵计算顺序写，目标是帮助写 kernel，而不是从 recurrent 公式慢慢推导。
+
+核心流程是：
 
 ```text
-单步语义 -> chunk 内 decay -> chunkwise 主公式 -> A/w/u/v_i 的区别 -> C=2,d=3 数值例子 -> kernel checklist
+reshape/GVA -> g.cumsum -> 构造 key-key 矩阵 B -> triangular solve 得到 A
+-> w/u -> chunk 内 Aqk -> v_delta -> output -> state update
 ```
 
-先记住一句话：
-
-```text
-KDA 用固定大小的 state S 代替完整 KV cache。
-它和 GDN 的主线一样：decay 旧 state，再用 delta rule 擦写。
-区别是：GDN 的 decay 是 scalar，KDA 的 decay 是 key/channel-wise vector。
-```
-
-本文省略 batch/head/chunk 维度，只看一个 chunk。变量名尽量和 `naive.py` 保持一致。令
+本文省略 batch、value-head、chunk id，只看一个 chunk。令 chunk size 为 $C$，key dim 为 $d_k$，value dim 为 $d_v$：
 
 $$
 q,k,g,w,k_{\text{right}}\in\mathbb{R}^{C\times d_k}
 $$
 
 $$
-v,u,v_{\text{delta}},o\in\mathbb{R}^{C\times d_v}
+v,u,v_{\Delta},o\in\mathbb{R}^{C\times d_v}
 $$
 
 $$
@@ -30,372 +25,188 @@ $$
 
 $$
 \beta\in\mathbb{R}^{C},\qquad
-A,Aqk\in\mathbb{R}^{C\times C}
+B,A,Aqk\in\mathbb{R}^{C\times C}
 $$
 
-其中：
+其中 `naive_chunk_kda` 里的 `A` 会被复用：一开始概念上是 key-key interaction，最后变成 triangular solve 后的矩阵。为了避免混淆，本文把 raw key-key interaction 记成 $B$，把 solve 后的最终矩阵记成 $A$。
 
-```text
-g:             log-space decay。chunk 代码里会被原地概念上改成 cumsum 后的累计 log decay。
-A:             代码里的块内三角解矩阵；论文里常记作 M。
-w:             代码里的 w = A @ (g.exp() * k)。
-u:             代码里的 u = A @ v。
-v_delta:       本文给有效写入取的名字；代码里在 chunk 循环中写成 v_i = u_i - w_i @ S。
-Aqk:           代码里的 chunk 内 query-key 读取矩阵；论文里常记作 E。
-k_right:       代码里不单独命名，对应 (g_last - g).exp() * k。
-```
+## 1. 入口 Shape
 
-入口张量的完整形状是：
+原始输入：
 
 $$
-q,k\in\mathbb{R}^{B\times T\times H\times K},\quad
-v,o\in\mathbb{R}^{B\times T\times HV\times V},\quad
-g\in\mathbb{R}^{B\times T\times HV\times K},\quad
-S\in\mathbb{R}^{B\times HV\times K\times V}
-$$
-
-进入 `naive_chunk_kda` 后会先 rearrange 并把 `q/k` 扩展到 value-head 维：
-
-$$
-q,k,g\in\mathbb{R}^{B\times HV\times NT\times BT\times K},\quad
-v,o\in\mathbb{R}^{B\times HV\times NT\times BT\times V}
-$$
-
-KDA kernel 的入口是：
-
-```text
-输入: q, k, v, g, beta, initial_state
-输出: o, final_state
-```
-
-decode 时一次只处理一个 token，直接用 recurrent update。prefill/training 时一次处理一段 prompt，所以要按 chunk 并行。
-
-论文 Appendix C 的伪代码里还会做：
-
-$$
-q\leftarrow q\cdot d_k^{-1/2}
-$$
-
-本文后面的公式默认 $q$ 已经完成这个 scale；写 reference 时要和这个约定保持一致。
-
-state 方向固定为：
-
-$$
-S_t\in\mathbb{R}^{d_k\times d_v},\qquad
-o_t=S_t^\top q_t\in\mathbb{R}^{d_v}
-$$
-
-## 1. 单步语义
-
-对一个 token，
-
-$$
-q_t,k_t,g_t\in\mathbb{R}^{d_k},\quad
-v_t,v_{\text{delta},t},o_t\in\mathbb{R}^{d_v},\quad
-\beta_t\in\mathbb{R}
-$$
-
-KDA 的单步公式是论文 Eq. 1。为了和代码一致，本文用 $\exp(g_t)$ 表示 per-channel decay：
-
-$$
-S_t
-=
-\left(I-\beta_t k_tk_t^\top\right)\operatorname{Diag}(\exp(g_t))S_{t-1}
-+
-\beta_tk_tv_t^\top
-$$
-
-和 GDN 一样，把它拆成“先 decay，再 delta 擦写”更好懂：
-
-$$
-\bar S_t=\operatorname{Diag}(\exp(g_t))S_{t-1}
-$$
-
-这个 $\bar S_t$ 只是把原公式里的 decayed old state 单独命名。把它代回原式：
-
-$$
-S_t
-=
-\left(I-\beta_t k_tk_t^\top\right)\bar S_t
-+
-\beta_tk_tv_t^\top
-$$
-
-展开括号：
-
-$$
-S_t
-=
-\bar S_t
--
-\beta_t k_tk_t^\top\bar S_t
-+
-\beta_tk_tv_t^\top
-$$
-
-其中：
-
-$$
-k_t^\top\bar S_t
-=
-(\bar S_t^\top k_t)^\top
-$$
-
-所以定义：
-
-$$
-\hat v_t=\bar S_t^\top k_t
-$$
-
-它表示“decayed old state 在当前 key $k_t$ 上已经读出来的 old value”。于是擦除项可以写成：
-
-$$
-\beta_t k_tk_t^\top\bar S_t
-=
-\beta_t k_t\hat v_t^\top
-$$
-
-再和写入项合并：
-
-$$
-S_t
-=
-\bar S_t
-+
-\beta_tk_t(v_t-\hat v_t)^\top
-$$
-
-因此定义 correction，也就是 chunk 代码里最终的 `v_i` 语义：
-
-$$
-v_{\text{delta},t}=\beta_t(v_t-\hat v_t)
-$$
-
-就得到：
-
-$$
-S_t=\bar S_t+k_tv_{\text{delta},t}^\top
+q,k\in\mathbb{R}^{B\times T\times H\times K}
 $$
 
 $$
-o_t=S_t^\top q_t
+v,o\in\mathbb{R}^{B\times T\times HV\times V}
 $$
 
-最小 decode reference：
+$$
+g\in\mathbb{R}^{B\times T\times HV\times K},\qquad
+\beta\in\mathbb{R}^{B\times T\times HV}
+$$
+
+`naive_chunk_kda` 先按 chunk reshape：
 
 ```python
-# q_i, k_i, g_i: [dk]
-# v_i:           [dv]
-# b_i:           scalar
-# S:             [dk, dv]
-
-S = S * g_i[:, None].exp()
-v_delta = b_i * (v_i - S.T @ k_i)
-S = S + k_i[:, None] @ v_delta[None, :]
-o_i = S.T @ q_i
+q, k = rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT)
+v, g, beta = rearrange(x, 'b (n c) h ... -> b h n c ...', c=BT)
 ```
 
-这里最重要的区别是：
+再把 `q/k` 从 qk head 扩展到 value head：
+
+```python
+G = HV // H
+q = q.repeat_interleave(G, dim=1) * scale
+k = k.repeat_interleave(G, dim=1)
+```
+
+进入每个 chunk 后：
 
 $$
-\text{GDN:}\quad \bar S_t=\exp(g_t)S_{t-1}
+q,k,g\in\mathbb{R}^{C\times d_k}
 $$
 
 $$
-\text{KDA:}\quad \bar S_t=\operatorname{Diag}(\exp(g_t))S_{t-1}
+v\in\mathbb{R}^{C\times d_v},\qquad
+\beta\in\mathbb{R}^{C}
 $$
 
-GDN 是整张 state 共享一个衰减；KDA 是 state 的每个 key/channel 行有自己的衰减。
+这里的 $q$ 已经乘过 attention scale，也已经按 GVA 扩展到 value-head 维。
 
-## 2. Chunk 内 decay
+## 2. Chunk 内累计 Gate
 
-GDN 里 $g_t$ 是 scalar，所以累计 decay 也是 scalar。KDA 里 $g_t$ 是 $d_k$ 维向量，所以累计 decay 也是 $d_k$ 维向量。
-
-论文 Appendix C 通常输入 log decay。进入一个 chunk 后先做：
+`naive_chunk_kda` 的第一步是：
 
 ```python
 g = g.cumsum(-2)
 ```
 
-和代码一致，chunk 入口处的原始 log gate 先记成 $g^{raw}$，执行 `g = g.cumsum(-2)` 后，后文的 $g$ 都表示累计 log gate：
+原始 per-token log gate 记为 $g^{raw}$，累计后：
 
 $$
-g^{raw}_r=\log\alpha_r
+g_r=\sum_{t=0}^{r}g^{raw}_t
 $$
 
-$$
-g_r=\sum_{j=1}^{r}g^{raw}_j
-$$
+因此：
 
 $$
-\exp(g_r)=\prod_{j=1}^{r}\alpha_j
+\exp(g_r)=\prod_{t=0}^{r}\exp(g^{raw}_t)
 $$
 
-其中：
-
-$$
-g_r,\exp(g_r)\in\mathbb{R}^{d_k}
-$$
-
-第 $i$ 个 token 的写入传到第 $r$ 个 token，需要 channel-wise 相对衰减：
+同一个 chunk 内，从 token $i$ 的写入传播到 token $r$ 的 channel-wise 相对 decay 是：
 
 $$
 \rho_{r,i}=\exp(g_r-g_i)\in\mathbb{R}^{d_k}
 $$
 
-直觉：
+kernel 中常用 `exp2`，所以实际 `g` 往往已经乘过 $\log_2(e)$。这时：
 
 $$
-\exp(g_r):\text{ chunk 起点到 }r\text{ 的每个 channel 的 decay}
-$$
-
-$$
-\rho_{r,i}:\text{ token }i\text{ 的写入传到 }r\text{ 时，每个 channel 还剩多少}
-$$
-
-`naive_chunk_kda` 的输入 `g` 已经是 log gate，所以直接 `g = g.cumsum(-2)`。`naive_recurrent_kda` 逐 token 更新，不需要 cumsum，循环里直接用 `g_i.exp()`。
-
-## 3. Chunkwise 主公式
-
-先定义三组和代码表达式对应的 decay 后张量：
-
-$$
-q_{\text{abs}}=\exp(g)\odot q
-$$
-
-$$
-k_{\text{abs}}=\exp(g)\odot k
-$$
-
-$$
-k_{\text{right},i}=\rho_{C,i}\odot k_i=\exp(g_C-g_i)\odot k_i
-$$
-
-KDA 的 chunk 内 query-key score 不是 GDN 那种 scalar gate 形式：
-
-$$
-(qk^\top)\odot\Gamma
-$$
-
-而是：
-
-$$
-Aqk=\operatorname{Tril}\left(q_{\text{abs}}\left(\frac{k}{\exp(g)}\right)^\top\right)
-$$
-
-也就是逐元素写成：
-
-$$
-Aqk_{r,i}=
-\begin{cases}
-q_r^\top(\rho_{r,i}\odot k_i),& r\ge i\\
-0,& r<i
-\end{cases}
-$$
-
-chunkwise 主公式是：
-
-$$
-\boxed{
-v_{\text{delta}}=u-wS_0
-}
-$$
-
-$$
-\boxed{
-o=q_{\text{abs}}S_0+Aqk\,v_{\text{delta}}
-}
-$$
-
-$$
-\boxed{
-S_C=\operatorname{Diag}(\exp(g_C))S_0+k_{\text{right}}^\top v_{\text{delta}}
-}
-$$
-
-这三行和 GDN 简化版一一对应：
-
-```text
-v_delta: 先算真正要写入/读取的 pseudo-value，代码里叫 v_i
-o:       旧 state 贡献 + chunk 内新写入贡献
-S_C:     decay 旧 state + 写入当前 chunk
-```
-
-注意，$k/\exp(g)$ 是数学写法。代码不会 materialize 这个除法，而是在构造每个 score 时用：
-
-$$
-\exp(g_r-g_i)
-$$
-
-## 4. A、w、u、v_i 为什么这样定义
-
-单步里：
-
-$$
-v_{\text{delta},r}=\beta_r(v_r-\bar S_r^\top k_r)
-$$
-
-但 $\bar S_r$ 已经包含前面 token 的写入，所以 $v_{\text{delta},r}$ 依赖 $v_{\text{delta},1},\dots,v_{\text{delta},r-1}$。
-
-把前面的展开代进去，可以得到：
-
-$$
-v_{\text{delta},r}
+\exp(g^{math}_r-g^{math}_i)
 =
-\beta_r v_r
--
-\beta_r S_0^\top(\exp(g_r)\odot k_r)
--
-\beta_r
-\sum_{i<r}
-v_{\text{delta},i}\,k_r^\top(\rho_{r,i}\odot k_i)
+2^{g^{kernel}_r-g^{kernel}_i}
 $$
 
-这里出现 key-key interaction：
+数学写法不变，只是底层指数函数换成 `exp2`。
 
-$$
-B_{r,i}=k_r^\top(\rho_{r,i}\odot k_i)
-$$
+## 3. 构造 Key-Key 矩阵 B
 
-代码里先把这个 key-key interaction 临时放进 `A`：
+`naive_chunk_kda` 里构造 `A` 的第一段是：
 
 ```python
-A[..., i] = torch.einsum('... c d, ... d -> ... c', k * (g - g_i).exp(), k_i)
+A = torch.zeros(*g.shape[:-1], BT)
+for i in range(BT):
+    k_i = k[..., i, :]
+    g_i = g[..., i:i+1, :]
+    A[..., i] = torch.einsum('... c d, ... d -> ... c', k * (g - g_i).exp(), k_i)
 ```
+
+按矩阵记号，这个 raw key-key interaction 是：
+
+$$
+B_{r,i}
+=
+k_r^\top(\exp(g_r-g_i)\odot k_i)
+$$
+
+等价矩阵写法是：
+
+$$
+B=(\exp(g)\odot k)(\exp(-g)\odot k)^\top
+$$
+
+注意这不是 GDN 里的 $(kk^\top)\odot\Gamma$。KDA 的 $\exp(g_r-g_i)$ 是 $d_k$ 维向量，必须进入 dot product 内部：
+
+$$
+B_{r,i}
+=
+\sum_{c=1}^{d_k}k_{r,c}\exp(g_{r,c}-g_{i,c})k_{i,c}
+$$
+
+这是写 KDA kernel 时最重要的区别。
+
+## 4. 从 B 到 A：Triangular Solve
+
+`naive_chunk_kda` 接着做：
+
+```python
+A = A * beta[..., None]
+A = -A.masked_fill(mask, 0)  # mask 是 triu(diagonal=0)
+for i in range(1, BT):
+    A[..., i, :i] = A[..., i, :i].clone() + (A[..., i, :, None].clone() * A[..., :, :i].clone()).sum(-2)
+A = (A + torch.eye(BT)) * beta[..., None, :]
+```
+
+第一行把 $\beta_r$ 乘到 row 上：
+
+$$
+C_{r,i}=\beta_r B_{r,i}
+$$
+
+然后保留 strict lower triangular 并取负：
+
+$$
+L=-\operatorname{StrictTril}(C)
+$$
+
+for loop 做的是 unit lower-triangular inverse 的 forward substitution：
+
+$$
+M=(I+\operatorname{StrictTril}(C))^{-1}
+$$
+
+因为 $L=-\operatorname{StrictTril}(C)$，所以代码里的 strict-lower 部分相当于在累积 $M-I$。
+
+最后一行把 $\beta_i$ 乘到 column 上：
+
+$$
+A=M\operatorname{Diag}(\beta)
+$$
 
 也就是：
 
 $$
-A^{raw}_{r,i}=k_r^\top(\exp(g_r-g_i)\odot k_i)
-$$
-
-矩阵写法对应论文 Eq. 6。论文通常把这个 raw key-key 矩阵记成 $B$：
-
-$$
-B=(\exp(g)\odot k)\left(\frac{k}{\exp(g)}\right)^\top
-$$
-
-然后代码继续复用 `A` 这个变量，用 lower-triangular solve 吸收 chunk 内依赖。求完之后的 `A` 才对应论文里的 $M$：
-
-$$
+\boxed{
 A=
-\left[
-I+\operatorname{StrictTril}\left(\operatorname{Diag}(\beta)B\right)
-\right]^{-1}
+\left(I+\operatorname{StrictTril}(\operatorname{Diag}(\beta)B)\right)^{-1}
 \operatorname{Diag}(\beta)
+}
 $$
 
-这里的 inverse 不是通用矩阵求逆，而是 unit lower-triangular forward substitution。
+kernel 里的 `Akk` 最终存的就是这个 $A$。`Akkd` 是 diagonal 16x16 block 的临时 buffer，后续 `inter_solve_fused` 会用它拼出完整 `Akk`。
 
-因此代码里的三行：
+## 5. 计算 w 和 u
+
+`naive_chunk_kda` 里：
 
 ```python
 w = A @ (g.exp() * k)
 u = A @ v
-v_i = u_i - w_i @ S
 ```
 
-对应数学写法：
+矩阵形式：
 
 $$
 w=A(\exp(g)\odot k)
@@ -405,286 +216,184 @@ $$
 u=Av
 $$
 
+shape 是：
+
 $$
-v_{\text{delta}}=u-wS_0
+w\in\mathbb{R}^{C\times d_k},\qquad
+u\in\mathbb{R}^{C\times d_v}
 $$
 
-直觉：
+含义：
 
 ```text
-u:        只看当前 chunk 的 value，会写进去什么
-w:        当前 chunk 会从旧 state 里擦掉/扣掉什么
-v_delta:  扣掉旧 state 影响后的有效写入 pseudo-value；代码变量名是 v_i
+u: 当前 chunk 的 value 经过 triangular solve 后的写入项。
+w: 当前 chunk 对 chunk 初始 state S0 的读取/擦除系数。
 ```
 
-为什么 `v_i` 要减 `w_i @ S`？因为 delta rule 不是盲写 $v_r$，而是写：
+后面真正用于输出和 state update 的 pseudo-value 是：
 
 $$
-v_r-\text{old value}
+v_{\Delta}=u-wS_0
 $$
 
-旧 value 来自 chunk 开始前的 state $S_0$，所以要从 `u` 里扣掉 `w @ S0`。
+代码对应：
 
-实现里推荐按 Appendix C 的伪代码直接算：
+```python
+v_i = u_i - w_i @ S
+```
 
-$$
-A^{raw}_{r,i}=\operatorname{dot}(k_r\odot\exp(g_r-g_i),k_i)
-$$
+## 6. 构造 Chunk 内 Aqk
 
-$$
-Aqk_{r,i}=\operatorname{dot}(q_r\odot\exp(g_r-g_i),k_i)
-$$
+在每个 chunk 的输出循环中，`naive_chunk_kda` 构造 `Aqk`：
 
-## 5. C=2,d=3 数值例子
+```python
+Aqk = torch.zeros(B, HV, BT, BT)
+for j in range(BT):
+    k_j = k[:, :, i, j]
+    g_j = g[:, :, i, j:j+1, :]
+    Aqk[..., j] = torch.einsum('... c d, ... d -> ... c', q_i * (g_i - g_j).exp(), k_j)
+Aqk = Aqk.masked_fill(mask, 0)  # mask 是 triu(diagonal=1)
+```
 
-取：
-
-$$
-C=2,\qquad d_k=d_v=3,\qquad S_0=I_3
-$$
-
-沿用 GDN 例子里的 $q,k,v,\beta$：
-
-$$
-\beta_1=0.8,\quad \beta_2=0.5
-$$
+逐元素：
 
 $$
-q=
-\begin{bmatrix}
-1 & 1 & 0.5\\
-1 & -1 & 2
-\end{bmatrix},
-\quad
-k=
-\begin{bmatrix}
-1 & 0 & 0\\
-0 & 1 & 0
-\end{bmatrix},
-\quad
-v=
-\begin{bmatrix}
-2 & 1 & 0.5\\
-1 & 3 & -1
-\end{bmatrix}
-$$
-
-KDA 的 raw channel-wise decay 取：
-
-$$
-\exp(g^{raw}_1)=
-\begin{bmatrix}
-0.5 & 0.8 & 1
-\end{bmatrix}
-$$
-
-$$
-\exp(g^{raw}_2)=
-\begin{bmatrix}
-0.25 & 0.5 & 0.75
-\end{bmatrix}
-$$
-
-所以执行 `g = g.cumsum(-2)` 后：
-
-$$
-\exp(g_1)=
-\begin{bmatrix}
-0.5 & 0.8 & 1
-\end{bmatrix},
-\qquad
-\exp(g_2)=
-\begin{bmatrix}
-0.125 & 0.4 & 0.75
-\end{bmatrix}
-$$
-
-因为 $k_1\perp k_2$，所以三角解之后的 `A` 等于 $\operatorname{Diag}(\beta)$。absolute-decayed key 是：
-
-$$
-k_{\text{abs}}=
-\exp(g)\odot k
+Aqk_{r,i}
 =
-\begin{bmatrix}
-0.5 & 0 & 0\\
-0 & 0.4 & 0
-\end{bmatrix}
+q_r^\top(\exp(g_r-g_i)\odot k_i),
+\qquad r\ge i
 $$
 
-于是：
+矩阵写法：
 
 $$
-w=A k_{\text{abs}}
-=
-\begin{bmatrix}
-0.4 & 0 & 0\\
-0 & 0.2 & 0
-\end{bmatrix}
+Aqk=\operatorname{Tril}\left((\exp(g)\odot q)(\exp(-g)\odot k)^\top\right)
+$$
+
+这里 `Tril` 保留 diagonal。因为输出 token $r$ 可以读到当前 token $r$ 的写入。
+
+## 7. Output 和 State Update
+
+对于 chunk $n$，设进入 chunk 前的 state 是 $S_0$。代码：
+
+```python
+v_i = u_i - w_i @ S
+o[:, :, i] = (q_i * g_i.exp()) @ S + Aqk @ v_i
+S = S * rearrange(g_i[:, :, -1].exp(), 'b h k -> b h k 1')
+S += rearrange((g_i[:, :, -1:] - g_i).exp() * k_i, 'b h c k -> b h k c') @ v_i
+```
+
+矩阵形式：
+
+$$
+v_{\Delta}=u-wS_0
 $$
 
 $$
-u=Av
-=
-\begin{bmatrix}
-1.6 & 0.8 & 0.4\\
-0.5 & 1.5 & -0.5
-\end{bmatrix}
+o=(\exp(g)\odot q)S_0+Aqk\,v_{\Delta}
 $$
 
-$$
-v_{\text{delta}}=u-wS_0
-=
-\begin{bmatrix}
-1.2 & 0.8 & 0.4\\
-0.5 & 1.3 & -0.5
-\end{bmatrix}
-$$
-
-旧 state 读取：
+令 chunk 最后一个 token 的累计 gate 为 $g_C$，定义：
 
 $$
-q_{\text{abs}}=
-\exp(g)\odot q
-=
-\begin{bmatrix}
-0.5 & 0.8 & 0.5\\
-0.125 & -0.4 & 1.5
-\end{bmatrix}
+k_{\text{right},i}=\exp(g_C-g_i)\odot k_i
 $$
 
-chunk 内读取矩阵：
+则 state update 是：
 
 $$
-Aqk=
-\begin{bmatrix}
-1 & 0\\
-0.25 & -1
-\end{bmatrix}
+S_C=\operatorname{Diag}(\exp(g_C))S_0+k_{\text{right}}^\top v_{\Delta}
 $$
 
-输出：
-
-$$
-o=
-q_{\text{abs}}S_0+Aqk\,v_{\text{delta}}
-=
-\begin{bmatrix}
-1.7 & 1.6 & 0.9\\
--0.075 & -1.5 & 2.1
-\end{bmatrix}
-$$
-
-state update 需要：
-
-$$
-k_{\text{right}}=
-\begin{bmatrix}
-0.25 & 0 & 0\\
-0 & 1 & 0
-\end{bmatrix}
-$$
-
-因此：
-
-$$
-S_C
-=
-\operatorname{Diag}(\exp(g_2))S_0+k_{\text{right}}^\top v_{\text{delta}}
-=
-\begin{bmatrix}
-0.425 & 0.2 & 0.1\\
-0.5 & 1.7 & -0.5\\
-0 & 0 & 0.75
-\end{bmatrix}
-$$
-
-这和逐 token recurrent reference 完全一致。
-
-## 6. Kernel Checklist
-
-最小实现流程：
+这三行就是写 kernel 时最常用的 chunkwise 主公式：
 
 ```text
-1. g = g.cumsum(-2)
-2. A_raw[r,i] = dot(k[r] * exp(g[r]-g[i]), k[i])
-3. A = inverse_lower(I + strict_lower(diag(beta) @ A_raw)) @ diag(beta)
-4. w = A @ (exp(g) * k)
-5. u = A @ v
-6. v_delta = u - w @ S
-7. Aqk[r,i] = dot(q[r] * exp(g[r]-g[i]), k[i]), i <= r
-8. o = (exp(g) * q) @ S + Aqk @ v_delta
-9. k_right = exp(g_C - g) * k
-10. S = exp(g_C)[:, None] * S + k_right.T @ v_delta
+v_delta = u - w @ S0
+o       = q_abs @ S0 + Aqk @ v_delta
+S_next  = g_last_exp[:, None] * S0 + k_right.T @ v_delta
+```
+
+## 8. 和 Kernel 中间量的对应
+
+`chunk_kda_fwd_intra` 主要负责得到：
+
+```text
+Aqk: [B, T, HV, BT]
+Akk: [B, T, HV, BT]
+w:   [B, T, HV, K]
+u:   [B, T, HV, V]
+qg:  [B, T, HV, K] 或 None
+kg:  [B, T, HV, K]
+```
+
+对应本文变量：
+
+```text
+Aqk -> Aqk
+Akk -> A
+w   -> A @ (exp(g) * k)
+u   -> A @ v
+qg  -> exp(g) * q，用于 disable_recompute=True 时保存
+kg  -> exp(g_last - g) * k，用于后续 state update
+```
+
+前向 kernel 拆分：
+
+```text
+1. intra diagonal:
+   safe_gate=False 用 chunk_kda_fwd_kernel_intra_token_parallel
+   safe_gate=True  用 chunk_kda_fwd_kernel_intra_sub_chunk
+
+2. inter-sub-chunk + solve:
+   chunk_kda_fwd_kernel_inter_solve_fused
+
+3. w/u/qg/kg:
+   recompute_w_u_fwd_kda_kernel
+```
+
+然后 `chunk_kda_fwd` 会继续调用：
+
+```text
+chunk_gated_delta_rule_fwd_h  # 跨 chunk recurrent state
+chunk_gla_fwd_o_gk            # 输出 o
+```
+
+## 9. Kernel Checklist
+
+按矩阵计算写 kernel 时，可以按这个顺序检查：
+
+```text
+1. q/k 是否已经按 GVA 从 H 扩展到 HV，q 是否已经乘 scale。
+2. g 是否已经是 chunk-local cumsum；Triton 路径里通常已经是 log2-space。
+3. B[r,i] = dot(k[r] * exp(g[r]-g[i]), k[i])。
+4. 只保留 B 的 strict lower 部分参与 Akk solve。
+5. A = inverse_lower(I + strict_lower(diag(beta) @ B)) @ diag(beta)。
+6. w = A @ (exp(g) * k)。
+7. u = A @ v。
+8. Aqk[r,i] = dot(q[r] * exp(g[r]-g[i]), k[i])，保留 lower 含 diagonal。
+9. v_delta = u - w @ S。
+10. o = (exp(g) * q) @ S + Aqk @ v_delta。
+11. k_right = exp(g_last - g) * k。
+12. S = exp(g_last)[:, None] * S + k_right.T @ v_delta。
 ```
 
 实现注意：
 
 ```text
-q 要和论文伪代码一样乘 d_k^{-0.5}，或者和 reference 保持同一约定。
-inverse_lower 不是真的求通用逆，而是 unit lower-triangular forward substitution。
-k/exp(g) 只是数学写法，实际优先用 exp(g_r-g_i)。
-q_abs、k_abs、k_right 都可以不 materialize，在 load 时乘 decay。
-代码复用 A：前半段 A 是 A_raw/B，lower-triangular solve 后 A 才是论文里的 M。
-代码里的 v_i 是 v_delta，不是原始输入 v。
+exp(g_r-g_i) 是 channel-wise，不能像 GDN 那样提出 dot product。
+不要 materialize exp(g) / exp(-g) 的完整矩阵，kernel 中通常边 load 边乘。
+Akk 的 diagonal 来自单位矩阵，不来自 raw B 的 diagonal。
+Aqk 保留 diagonal，Akk/B solve 使用 strict lower。
+Akkd 只是 diagonal sub-chunk 的临时 fp32 buffer，最终消费的是完整 Akk。
 ```
 
-和论文对应：
+## 10. 和 Recurrent 语义的最短连接
 
-```text
-Eq. 1: 单步 recurrent
-Eq. 6: A_raw/B 和 A/M 的 lower-triangular solve
-Eq. 7: w = A(exp(g)*k), u = A v
-Eq. 8: state update
-Eq. 9: o = old state 贡献 + chunk 内贡献
-Appendix C Listing 1: g.cumsum 和 exp(g_r-g_i)
-```
-
-## 7. 和 GDN 的关系
-
-KDA 可以看成把 GDN 的 scalar decay 推广成 channel-wise decay。
-
-GDN 里：
+如果只想确认 chunk 公式和 recurrent reference 是同一件事，可以记住单步更新：
 
 $$
-\Gamma_{r,i}=\exp(g_r-g_i)\in\mathbb{R}
+S_t=\operatorname{Diag}(\exp(g^{raw}_t))S_{t-1}
++\beta_t k_t\left(v_t-S_{t-1}^{\top}\left(\exp(g^{raw}_t)\odot k_t\right)\right)^\top
 $$
 
-所以：
-
-$$
-q_r^\top(\Gamma_{r,i}k_i)=\Gamma_{r,i}(q_r^\top k_i)
-$$
-
-它可以先算 $qk^\top$，再乘 $C\times C$ 的 scalar mask。
-
-KDA 里：
-
-$$
-\rho_{r,i}=\exp(g_r-g_i)\in\mathbb{R}^{d_k}
-$$
-
-所以：
-
-$$
-q_r^\top(\rho_{r,i}\odot k_i)
-=
-\sum_c q_{r,c}\rho_{r,i,c}k_{i,c}
-$$
-
-因为每个 channel 的 $\rho_{r,i,c}$ 都可能不同，它不能从求和里提出去。只有当所有 channel 的衰减都相同，KDA 才退化成 GDN 那种 scalar mask。
-
-实现开销上，可以这样简化理解：
-
-```text
-GDN:
-  exp(g) 是 [C]
-  score = (q @ k.T) * Gamma
-  state decay 是整张 state 乘一个数
-
-KDA:
-  exp(g) 是 [C, dk]
-  score = dot(q[r] * exp(g[r]-g[i]), k[i])
-  state decay 是每一行乘一个数
-```
-
-主复杂度没有质变，构造 `A_raw`/`Aqk` 的主项仍然是 $O(C^2d_k)$。KDA 多出来的主要是 $O(Cd_k)$ 的 channel-wise scaling、`exp` 和中间值管理；换来的是同一个 head 内可以同时有长记忆 channel 和短记忆 channel。
+`naive_chunk_kda` 做的事情就是把一个 chunk 内所有 token 的这种依赖整理成 lower-triangular matrix solve。矩阵 $A$ 吸收了 chunk 内 token 之间的 delta-rule 擦写依赖，`Aqk` 负责 chunk 内新写入对输出的贡献，`w/u` 负责把 chunk 初始 state $S_0$ 的影响扣掉。
