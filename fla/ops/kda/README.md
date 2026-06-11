@@ -117,6 +117,8 @@ g = lower_bound * sigmoid(exp(A_log) * (raw_g + dt_bias))
 
 这样可以把 log-space gate 限制在 `[lower_bound, 0)`，并允许部分 kernel 使用更高吞吐的路径。
 
+`kda_gate_chunk_cumsum_vector_kernel` 的详细计算流程，包括 raw gate logits、`A_log`、`dt_bias`、chunk-local cumsum 和 shape 变化，见 [`docs/KDA Gate Chunk Cumsum.md`](docs/KDA%20Gate%20Chunk%20Cumsum.md)。
+
 ### 5. 读 chunk 前向拆解
 
 入口文件：

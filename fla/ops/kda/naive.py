@@ -117,7 +117,7 @@ def naive_chunk_kda(
     # Expand q/k to value head dim for GVA: [B, H, ...] -> [B, HV, ...]
     q = q.repeat_interleave(G, dim=1) * scale  # [B, HV, NT, BT, K]
     k = k.repeat_interleave(G, dim=1)          # [B, HV, NT, BT, K]
-    g = g.cumsum(-2) # chunk内只有一个state，所以需要将chunk内的token的gate求和
+    g = g.cumsum(-2) # chunk内只有一个state，所以需要将chunk内的token的gate求和 [B, H, NT, K]
 
     # note that diagonal is masked.
     mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=0)

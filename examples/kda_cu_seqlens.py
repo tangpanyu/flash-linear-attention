@@ -79,6 +79,8 @@ def main():
     print(f"o.shape: {tuple(o.shape)}")
     print(f"initial_state.shape: {tuple(initial_state.shape)}")
     print(f"g_raw.shape: {tuple(g_raw.shape)}")
+    print(f"beta_rwa.shape: {tuple(beta_raw.shape)}")
+    print(f"A_log.shape: {tuple(A_log.shape)}")
     print(f"final_state.shape: {tuple(final_state.shape)}")
     print(f"loss: {loss.item():.6f}")
     print(f"g_raw.grad is None: {g_raw.grad is None}")

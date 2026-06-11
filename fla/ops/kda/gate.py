@@ -380,6 +380,11 @@ def kda_gate_chunk_cumsum_vector_kernel(
     IS_VARLEN: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
 ):
+    # For each [BT, BS] tile, compute the activated log-decay from input `s`
+    # and write its chunk-local prefix sum to `o`.
+    # x_t = s_t + dt_bias_h if HAS_BIAS else s_t.
+    # y_t = lower_bound * sigmoid(exp(A_log_h) * x_t) if USE_LOWER_BOUND else -exp(A_log_h) * softplus(x_t).
+    # o_t = scale * cumsum(y)_t if HAS_SCALE else cumsum(y)_t; REVERSE selects suffix cumsum.
     i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
@@ -442,6 +447,7 @@ def kda_gate_chunk_cumsum(
     assert chunk_size == 2**(chunk_size.bit_length()-1), "chunk_size must be a power of 2"
 
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
+    print(f'lower_bound : {lower_bound}')
     def grid(meta): return (triton.cdiv(meta['S'], meta['BS']), NT, B * H)
     kda_gate_chunk_cumsum_vector_kernel[grid](
         s=g_org,
