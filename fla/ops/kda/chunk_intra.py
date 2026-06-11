@@ -790,8 +790,10 @@ def chunk_kda_fwd_intra(
     # Separate fp32 buffer for diagonal 16x16 blocks (for precision in solve_tril)
     Akkd = torch.empty(B, T, HV, BC, device=k.device, dtype=torch.float32)
 
-    # Step 1: Run token_parallel first to compute diagonal blocks into Akkd (fp32)
-    # Step 1: compute diagonal blocks into Akk_diag (fp32)
+    # Step 1: compute diagonal 16x16 blocks into the fp32 Akkd buffer.
+    # `safe_gate` uses the sub-chunk kernel to avoid the token-parallel exp-difference
+    # path when gate values may be numerically aggressive; the default path keeps the
+    # token-parallel kernel for better throughput.
     if safe_gate:
         grid = (NT, NC, B * HV)
         BK = triton.next_power_of_2(K)
@@ -828,7 +830,8 @@ def chunk_kda_fwd_intra(
             sub_chunk_size=BC,
         )
 
-    # Step 2: Fused inter + solve_tril (works for both fixed-len and varlen)
+    # Step 2: fill inter-sub-chunk Aqk/Akk terms and solve the triangular Akk system.
+    # This fused kernel handles both fixed-length and cu_seqlens varlen layouts.
     grid = (NT, B * HV)
     chunk_kda_fwd_kernel_inter_solve_fused[grid](
         q=q,

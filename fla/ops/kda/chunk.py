@@ -63,6 +63,9 @@ class ChunkKDAFunction(torch.autograd.Function):
 
         chunk_indices = None
         if cu_seqlens is not None:
+            # seg_id          = [0, 0, 1, 2, 2, 2, 2]
+            # intra_chunk_idx = [0, 1, 0, 0, 1, 2, 3]
+            # 表示句0号句子有2个chunk，分别为0，1；
             chunk_indices = prepare_chunk_indices(
                 cu_seqlens,
                 chunk_size,
@@ -359,6 +362,7 @@ def chunk_kda(
         )
         state_v_first = kwargs.pop('transpose_state_layout')
 
+    # KDA的CP是训练/prefill时将
     if cp_context is not None:
         assert initial_state is None, "Initial state is not supported for CP"
         assert output_final_state is False, "Output final state is not supported for CP"

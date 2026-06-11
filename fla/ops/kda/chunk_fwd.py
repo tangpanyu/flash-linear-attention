@@ -40,9 +40,11 @@ def chunk_kda_fwd(
     return_intermediate_states: bool = False,
     cp_context: FLACPContext | None = None,
 ):
-    # Apply gate activation
     g_org = None
     if use_gate_in_kernel:
+        # Fuse the KDA gate activation with the per-chunk prefix sum when raw gate logits
+        # are passed in. This path is needed when `A_log`, `dt_bias`, or `lower_bound`
+        # must be applied before the cumulative log-decay is consumed by later kernels.
         g_org = g
         g = kda_gate_chunk_cumsum(
             g=g_org,
@@ -55,6 +57,8 @@ def chunk_kda_fwd(
             lower_bound=lower_bound,
         )
     else:
+        # Use the generic local cumsum when `g` is already the activated log-decay.
+        # The result is scaled by log2(e) because downstream Triton kernels use exp2.
         g = chunk_local_cumsum(
             g=g,
             scale=RCP_LN2,
@@ -63,7 +67,9 @@ def chunk_kda_fwd(
             chunk_indices=chunk_indices
         )
 
-    # qg = None if disable_recompute is False
+    # Build the within-chunk attention factors. This launches the KDA intra kernels that
+    # compute Aqk, invert the lower-triangular Akk blocks, and produce WY intermediates.
+    # qg is only materialized when recomputation is disabled.
     w, u, qg, kg, Aqk, Akk = chunk_kda_fwd_intra(
         q=q,
         k=k,
@@ -79,6 +85,9 @@ def chunk_kda_fwd(
     )
 
     if cp_context is not None:
+        # Context Parallel needs the initial recurrent state from previous ranks.
+        # This branch launches CP pre-process kernels plus communication to synthesize h0;
+        # the non-CP path can use the caller-provided `initial_state` directly.
         initial_state = chunk_gated_delta_rule_fwd_h_pre_process(
             k=kg,
             w=w,
@@ -91,6 +100,8 @@ def chunk_kda_fwd(
             state_v_first=state_v_first,
         )
 
+    # Run the inter-chunk recurrent scan for the gated delta rule. The kernel returns
+    # per-chunk states `h`, WY-updated values `v_new`, and optionally the final state.
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=kg,
         w=w,
@@ -112,6 +123,8 @@ def chunk_kda_fwd(
         # only the first state in the tensor is relevant. We compress it to optimize memory for `save_for_backward`.
         initial_state = compress_h0(initial_state, context=cp_context)
 
+    # Combine the intra-chunk Aqk contribution with the recurrent state contribution
+    # to produce the final KDA output.
     o = chunk_gla_fwd_o_gk(
         q=q,
         v=v_new,

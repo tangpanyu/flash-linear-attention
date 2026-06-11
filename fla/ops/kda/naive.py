@@ -27,7 +27,7 @@ def naive_recurrent_kda(
             Keys of shape ``[B, T, H, K]``.
         v (torch.Tensor):
             Values of shape ``[B, T, HV, V]``. ``HV`` must be divisible by ``H``.
-        g (torch.Tensor):
+        g (torch.Tensor): T是因为在训练或者prefill时，要使用不同的state
             Per-dimension decay gates (log-space) of shape ``[B, T, HV, K]``.
         beta (torch.Tensor):
             Beta scalars of shape ``[B, T, HV]``.
@@ -117,7 +117,7 @@ def naive_chunk_kda(
     # Expand q/k to value head dim for GVA: [B, H, ...] -> [B, HV, ...]
     q = q.repeat_interleave(G, dim=1) * scale  # [B, HV, NT, BT, K]
     k = k.repeat_interleave(G, dim=1)          # [B, HV, NT, BT, K]
-    g = g.cumsum(-2)
+    g = g.cumsum(-2) # chunk内只有一个state，所以需要将chunk内的token的gate求和
 
     # note that diagonal is masked.
     mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=0)
