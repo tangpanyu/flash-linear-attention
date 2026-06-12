@@ -701,6 +701,9 @@ def chunk_kda_fwd_kernel_intra_sub_chunk(
     Aqk = Aqk + (bos * HV + i_hv) * BT
     Akk = Akk + (bos * HV + i_hv) * BC
 
+    # q.shape == [B, T, H, K] base地址已经考虑到了head，然后T的stride是H*K
+    # 则每次加载都会加载到该Token的Head，offset是该submatrix的base
+    # (BC, BK)会对应到T的变化，所以说：BC+1的地址是T+1
     p_q = tl.make_block_ptr(q, (T, K), (H*K, 1), (i_ti, 0), (BC, BK), (1, 0))
     p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_ti, 0), (BC, BK), (1, 0))
     p_g = tl.make_block_ptr(g, (T, K), (HV*K, 1), (i_ti, 0), (BC, BK), (1, 0))

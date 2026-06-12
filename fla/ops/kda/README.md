@@ -28,6 +28,8 @@ o <- q^T S
 
 ## 推荐阅读顺序
 
+读 kernel 前容易混淆的 gate shape、chunk cumsum、`g_last` 和 `g_r-g_i` 的区别，先看 [`docs/关键知识点总结.md`](docs/关键知识点总结.md)。
+
 ### 1. 先读参考实现
 
 入口文件：
@@ -162,6 +164,8 @@ chunk_kda_fwd
 - `chunk_kda_fwd_kernel_intra_sub_chunk`
 - `chunk_kda_bwd_kernel_intra`
 - `chunk_kda_bwd_kernel_wy_dqkg_fused`
+
+其中 `safe_gate=True` 时使用的 `chunk_kda_fwd_kernel_intra_sub_chunk` 见 [`docs/KDA Intra Sub Chunk.md`](docs/KDA%20Intra%20Sub%20Chunk.md)。
 
 读 kernel 时可以先跟踪张量含义，不急着逐行看指针偏移：
 

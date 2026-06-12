@@ -447,7 +447,7 @@ def kda_gate_chunk_cumsum(
     assert chunk_size == 2**(chunk_size.bit_length()-1), "chunk_size must be a power of 2"
 
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
-    print(f'lower_bound : {lower_bound}')
+    print(f'lower_bound : {scale}')
     def grid(meta): return (triton.cdiv(meta['S'], meta['BS']), NT, B * H)
     kda_gate_chunk_cumsum_vector_kernel[grid](
         s=g_org,
