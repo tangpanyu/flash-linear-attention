@@ -86,13 +86,16 @@ def pre_process_fwd_kernel_merged(
     # For DPLR (USE_BG), w and bg share the same head dim H as k/ag.
     # For GDN/KDA, w has head dim HV (same as v).
     k += ((bos * H + i_h // (HV // H)) * K).to(tl.int64)
+    # DPLR/generalized delta rule 风格，多一个 bg 改变 state transition
     if USE_BG:
         w += ((bos * H + i_h // (HV // H)) * K).to(tl.int64)
         bg += ((bos * H + i_h // (HV // H)) * K).to(tl.int64)
     else:
         w += ((bos * HV + i_h) * K).to(tl.int64)
+    # scalar per-head gate，GDN/GLA 风格
     if USE_G:
         g += (bos * HV + i_h).to(tl.int64)
+    # per-key-dim gate，KDA 风格
     if USE_GK:
         gk += ((bos * HV + i_h) * K).to(tl.int64)
     stride_k = H * K
@@ -773,6 +776,7 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
         grid = (triton.cdiv(V, BLOCK_SIZE) + triton.cdiv(K, BLOCK_SIZE), HV)
         # For DPLR, v provides the original v for computing h contributions,
         # while u remains the WY-processed values (A_ab @ A_ak @ v) for v_new = w @ h + u.
+        # 这里说明的是当前rank用cu_seqlens，但是我只算末尾的句子
         pre_process_fwd_kernel_merged[grid](
             k=k,
             v=u if v is None else v,

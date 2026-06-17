@@ -1,0 +1,4 @@
+interface:
+  display_name: "Read CUDA/Triton Kernel"
+  short_description: "Explain CUDA/Triton kernel execution models"
+  default_prompt: "Use $read-cuda-triton-kernel to explain this CUDA or Triton kernel execution model."

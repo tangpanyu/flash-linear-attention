@@ -26,6 +26,16 @@ else:
 ################################################################################
 
 
+def prune_kda_inter_solve_configs(configs, named_args, **kwargs):
+    NC = kwargs.get("NC", named_args.get("NC"))
+    if NC >= 4:
+        return [
+            config for config in configs
+            if config.kwargs["BK"] == 32 and config.num_warps in (1, 2)
+        ]
+    return configs
+
+
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
@@ -36,6 +46,7 @@ else:
         for num_warps in [1, 2, 4]
     ],
     key=["H", "HV", "K", "BT", "BC", "NC"],
+    prune_configs_by={"early_config_prune": prune_kda_inter_solve_configs},
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])

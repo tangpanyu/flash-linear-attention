@@ -109,6 +109,7 @@ def chunk_kda_fwd_kernel_intra_token_parallel(
     b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
     b_k = b_k * tl.load(p_beta, boundary_check=(0,)).to(tl.float32)[:, None]
 
+    # it + 1表示现有token的末尾，T表示当前sequence tokens，i_ts + BC表示当前submatrix的末尾
     for j in range(i_ts, min(i_t + 1, min(T, i_ts + BC))):
         b_kj = tl.load(k + j * H * K + p_qk, mask=m_hk, other=0).to(tl.float32)
         p_gj = tl.make_block_ptr(g + j * HV * K, (HV, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0))
