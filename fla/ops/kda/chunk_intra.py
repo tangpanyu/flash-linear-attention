@@ -800,6 +800,8 @@ def chunk_kda_fwd_intra(
 
     Aqk = torch.empty(B, T, HV, BT, device=k.device, dtype=k.dtype)
     # Akk must be zero-initialized - kernel only writes lower triangular
+    # 如果所有的则是[B, HV, T, T],但是每个chunk有自己的Akk,他的shape是[B, HV, BT, BT]
+    # cat起来就是[B, HV, T, BT]
     Akk = torch.zeros(B, T, HV, BT, device=k.device, dtype=k.dtype)
     # Separate fp32 buffer for diagonal 16x16 blocks (for precision in solve_tril)
     Akkd = torch.empty(B, T, HV, BC, device=k.device, dtype=torch.float32)
