@@ -776,7 +776,7 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
         grid = (triton.cdiv(V, BLOCK_SIZE) + triton.cdiv(K, BLOCK_SIZE), HV)
         # For DPLR, v provides the original v for computing h contributions,
         # while u remains the WY-processed values (A_ab @ A_ak @ v) for v_new = w @ h + u.
-        # 这里说明的是当前rank用cu_seqlens，但是我只算末尾的句子
+        # 这里说明的是当前rank用cu_seqlens，但是我只算末尾的句子，因为推理只需要末尾的
         pre_process_fwd_kernel_merged[grid](
             k=k,
             v=u if v is None else v,
